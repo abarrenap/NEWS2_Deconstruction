@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -102,6 +103,58 @@ def _panel(
     """
 
 
+
+def _auc_analysis_section(figures_dir):
+    """Embed saved attribution figures; never rerun an analysis."""
+    if figures_dir is None:
+        return ""
+    figures_dir = Path(figures_dir)
+    panels = []
+    for cohort in ("Prehospital", "Hospital"):
+        for outcome, label in (("M30D", "30-day mortality"), ("UVI", "ICU admission")):
+            slug = f"{cohort.lower()}_{outcome.lower()}"
+            images = []
+            for folder, suffix, heading, explanation in (
+                ("shapley_auc", "shapley_auc", "Shapley attribution of AUC",
+                 "Bars allocate the full-score AUC above chance (AUC minus 0.5). "
+                 "Percentages sum to 100% within each experiment, including negative "
+                 "contributions. They describe contribution magnitude, not statistical significance."),
+                ("dominance_auc", "auc_dominance", "Pairwise dominance analysis",
+                 "Read each cell as the number of 32 common contexts where adding the row "
+                 "parameter improves AUC more than adding the column parameter. CD means "
+                 "strict complete dominance: 32 wins in 32 contexts. The empty context has "
+                 "AUC = 0.5; numerical ties are not wins. Intermediate counts indicate "
+                 "context-dependent superiority. Colors use Turbo on a fixed 0–1 scale. "
+                 "Win counts measure frequency, not the magnitude of AUC improvement; "
+                 "they are descriptive and have no uncertainty intervals."),
+            ):
+                path = figures_dir / folder / f"{slug}_{suffix}.png"
+                if not path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing saved plot: {path}. Run its notebook cell before exporting."
+                    )
+                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+                alt = escape(f"{cohort}, {label}: {heading}", quote=True)
+                images.append(
+                    f'<h4>{heading}</h4><p class="lede">{explanation}</p>'
+                    f'<img src="data:image/png;base64,{encoded}" alt="{alt}" '
+                    'style="display:block;width:100%;height:auto;margin:1rem auto;">'
+                )
+            panels.append(
+                f'<article class="experiment-panel"><h3>{cohort} — {label}</h3>'
+                + "".join(images) + '</article>'
+            )
+    return (
+        '<section id="auc-attribution-dominance"><h2>Shapley attribution and dominance</h2>'
+        '<p class="lede">Four setting–outcome analyses of discrimination. '
+        'These figures explain subset AUCs, rather than individual NEWS2 scores. '
+        'All subsets must use the same patients, folds, and AUC aggregation. '
+        'Complete dominance can establish a partial hierarchy; it need not order every parameter.</p>'
+        '<div style="display:grid;grid-template-columns:1fr;gap:2rem;max-width:1200px;margin:auto;">'
+        + "".join(panels) + '</div></section>'
+    )
+
+
 def create_news2_scale_html(
     experiments: Sequence[ScaleExperimentReport],
     feature_order: Sequence[str],
@@ -109,6 +162,7 @@ def create_news2_scale_html(
     *,
     title: str = "NEWS2 scale deconstruction",
     component_delta_results: pd.DataFrame | None = None,
+    figures_dir: str | Path | None = None,
 ) -> Path:
     """Write one self-contained report covering all four experiments."""
     if len(experiments) != 4:
@@ -176,6 +230,8 @@ def create_news2_scale_html(
         )
         include_plotlyjs = False
 
+    auc_section = _auc_analysis_section(figures_dir)
+
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -240,6 +296,7 @@ def create_news2_scale_html(
     <h2>Experiment details</h2>
     <div class="grid">{''.join(panels)}</div>
   </section>
+  {auc_section}
   {delta_section}
   <footer>Generated from the nested-CV NEWS2 scale deconstruction results.</footer>
 </main>

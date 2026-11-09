@@ -24,7 +24,7 @@ The combined interactive report is included in the repository root:
 
 **[NEWS2 scale deconstruction report](NEWS2_scale_deconstruction_report.html)**
 
-Download the HTML file and open it in a web browser to explore the results and interactive figures.
+Download the HTML file and open it in a web browser to explore the results. The report includes interactive subset and ablation figures, four Shapley AUC charts, and four dominance matrices. The latter eight figures are embedded images, so the report remains self-contained.
 
 ## Analysis workflow
 
@@ -35,11 +35,43 @@ Download the HTML file and open it in a web browser to explore the results and i
 5. Select classification thresholds using inner folds of the outer-training data.
 6. Evaluate performance on the untouched outer-test fold.
 7. Compare subset performance, parameter removal effects, and component-level AUC differences.
-8. Generate interactive figures and a combined HTML report.
+8. Decompose AUC above chance using exact Shapley attribution.
+9. Compare parameters through pairwise complete-dominance analysis.
+10. Generate figures and a combined self-contained HTML report.
 
 The notebook configures **10 outer folds** and a random seed of **42**. Evaluation includes ROC AUC, balanced accuracy, sensitivity, and specificity.
 
 The prediction score is the sum of the retained NEWS2 component points. No predictive model is fitted.
+
+## Shapley decomposition of discrimination
+
+For each setting and outcome, exact Shapley values attribute the full NEWS2 score’s discrimination above chance to its seven parameters. A parameter’s contribution is its incremental AUC gain, averaged across all possible orders in which parameters could be added.
+
+The analysis assigns AUC = 0.5 to the empty subset and uses the mean outer-fold AUC for every non-empty subset. Contributions sum to **full-score AUC − 0.5**. Bars express each contribution as a percentage of that total and sum to 100%, including any negative contributions. Percentage attribution requires the full-score AUC to exceed 0.5.
+
+A contribution of 30% means 30% of the discrimination above chance, not an AUC increase of 0.30. Percentages are relative to each experiment’s full-score AUC; use the exported absolute AUC contributions when comparing magnitudes between experiments.
+
+## Dominance analysis
+
+For each pair of parameters, the analysis compares the AUC gain from adding either parameter to the **same subset** of the other five parameters. There are **32 common contexts per pair**, including the empty subset.
+
+Each experiment has its own matrix:
+
+- **Rows:** candidate parameters; **columns:** comparison parameters.
+- **Cell counts:** contexts where the row parameter adds more AUC than the column parameter.
+- **32/32 · CD:** strict complete dominance; the row parameter contributes more in every common context.
+- **Intermediate counts:** superiority depends on the combination; complete dominance is not established.
+- **Ties:** differences within `1e-10` are treated as numerical ties and are not counted as wins.
+
+All four matrices use the Turbo color scale over the same 0–1 range. The color represents the fraction of contexts won, not the magnitude of the AUC advantage. Complete dominance can establish a partial hierarchy without ordering every parameter. A larger incremental contribution can also mean a smaller AUC reduction when both additions reduce discrimination.
+
+These are descriptive comparisons of fixed NEWS2 partial scores, without significance tests or uncertainty intervals. All subsets must use the same patients, folds, and AUC aggregation. The Shapley contributions correspond to general dominance weights for this AUC-based game; ranking first by Shapley contribution does not establish complete dominance.
+
+## Parameter-removal and patient-level plots
+
+The marginal ablation plots show **AUC after removal minus AUC before removal** for 63 pairs per parameter, excluding pairs that leave an empty score. Negative values indicate reduced discrimination after removal. These 63 removal pairs differ from the 32 common contexts used to compare a pair of parameters in the dominance matrices.
+
+The optional patient-level SHAP beeswarm and bar plots explain contributions to individual **NEWS2 point totals**, relative to a sampled background. They do not attribute outcome discrimination and are separate from the Shapley AUC and dominance analyses. The HTML’s eight new attribution figures are the four AUC charts and four dominance matrices; optional patient-level SHAP figures are not embedded by this export workflow.
 
 ## Repository contents
 
@@ -53,7 +85,10 @@ The prediction score is the sum of the retained NEWS2 component points. No predi
 │   ├── news2_scale_deconstruction.py
 │   ├── news2_scale_utils.py
 │   ├── news2_scale_html_report.py
-│   └── test_news2_scale_deconstruction.py
+│   ├── news2_auc_shapley.py
+│   ├── news2_auc_dominance.py
+│   ├── shap_values.py
+│   └── test_news2_scale_decomposition.py
 ├── requirements.txt
 └── README.md
 ```
@@ -66,7 +101,10 @@ The prediction score is the sum of the retained NEWS2 component points. No predi
 | `functions/news2_scale_deconstruction.py` | Component scoring, threshold optimization, subset evaluation, resumable searches, and component comparisons. |
 | `functions/news2_scale_utils.py` | Stratified fold assignment and subset visualization utilities. |
 | `functions/news2_scale_html_report.py` | Interactive HTML report generation. |
-| `functions/test_news2_scale_deconstruction.py` | Tests for component scoring, threshold selection, and separation of training and test labels. |
+| `functions/test_news2_scale_decomposition.py` | Tests for component scoring, threshold selection, and separation of training and test labels. |
+| `functions/news2_auc_shapley.py` | Exact Shapley decomposition of AUC above chance and attribution charts. |
+| `functions/news2_auc_dominance.py` | Pairwise dominance matrices, summary counts, and context-specific AUC gains. |
+| `functions/shap_values.py` | Optional patient-level SHAP explanations of NEWS2 points. |
 | `requirements.txt` | Python dependencies. |
 
 ## Installation
@@ -148,20 +186,36 @@ The workflow produces subset-level results, checkpoint files, interactive visual
 The visualizations include:
 
 - Subset performance across the number of retained parameters
-- Performance matrices and Pareto frontiers
 - Changes in AUC after removing individual parameters
 - Component-level AUC comparisons
+- Four Shapley AUC attribution charts, one per setting and outcome
+- Four pairwise dominance matrices, one per setting and outcome
 
 The published report is stored in the repository root as `NEWS2_scale_deconstruction_report.html`.
 
 When rerunning the analysis, the destination of the newly generated report is determined by the report-generation cell in the notebook. To save it directly to the repository root, use `Path("NEWS2_scale_deconstruction_report.html")` as the report destination when running Jupyter from that folder.
+
+### Figure exports and HTML generation
+
+Each experiment’s Shapley AUC chart and dominance matrix appears after its experiment in the notebook. With the current `OUTPUT_DIR`, exports are organized as:
+
+```text
+data/outputs/news2_scale_deconstruction/
+├── shapley_auc/      # Four charts (PNG/PDF) and attribution tables (CSV)
+├── dominance_auc/    # Four matrices (PNG/PDF), summaries and contexts (CSV)
+└── NEWS2_shapley_auc.csv
+```
+
+Run all four Shapley chart cells and all four dominance matrix cells **before** the HTML export cell. The export passes `figures_dir=OUTPUT_DIR` and embeds the eight saved PNG files as image data inside the HTML. It does not recalculate these figures and raises an error if an expected image is missing. Regenerate the figures after changing data or settings to avoid embedding stale images.
+
+The published HTML can be viewed without the dataset or output folders. Regenerating the complete report requires the experiment result tables and saved figures. Patient-level SHAP cells are optional and are not required for this export.
 
 ## Validation
 
 Run the included tests from the repository root:
 
 ```bash
-python -m pytest functions/test_news2_scale_deconstruction.py
+python -m pytest functions/test_news2_scale_decomposition.py
 ```
 
 The tests check that component scores reproduce the reference NEWS2 total, threshold optimization maximizes the specified inner-fold criterion, and outer-test labels do not influence threshold selection.

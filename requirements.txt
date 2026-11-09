@@ -6,3 +6,5 @@ tqdm
 ipywidgets
 jupyterlab
 pytest
+matplotlib
+shap
