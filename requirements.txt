@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+plotly
+tqdm
+ipywidgets
+jupyterlab
+pytest
