@@ -230,3 +230,7 @@ The supplied dependency list does not pin package versions. Record the environme
 python -m pip freeze > requirements-frozen.txt
 ```
 
+
+## Sensitivity analyses and confidence intervals
+
+See [the sensitivity analysis README](sensitivity%20analisis/README.md) for the bootstrap, consciousness and oxygen-scale analyses.

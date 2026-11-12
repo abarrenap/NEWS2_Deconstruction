@@ -3,7 +3,11 @@
 This module performs no analysis on import. Notebook cells initiate execution.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED,
+)
+from multiprocessing import get_context
+from threadpoolctl import threadpool_limits
 from itertools import combinations
 from pathlib import Path
 import hashlib
@@ -133,6 +137,54 @@ def evaluate_all_subsets(data, outcome, experiment_id, n_jobs=1, progress=None):
         return collect(pool.map(evaluate, SUBSETS))
 
 
+def _evaluate_bootstrap_sample(sample, replicate, n_splits, random_state,
+                               subset_jobs=1, subset_progress=None):
+    """Evaluate all four experiments for one complete dataset."""
+    keep = ["subset_key", "subset_label", "features_json", "n_features",
+            "auc", "balanced_accuracy", "threshold_mean"]
+    rows = []
+    seed = int(np.random.SeedSequence([random_state, replicate + 1, 867]).generate_state(1)[0])
+    for setting, suffix in (("Prehospital", "1"), ("Hospital", "H")):
+        cohort = prepare_cohort(sample, suffix, gcs_cutoff=15)
+        for outcome in OUTCOMES:
+            folded = assign_grouped_folds(cohort, outcome, n_splits, seed)
+            result = evaluate_all_subsets(
+                folded, outcome, f"bootstrap_{replicate}_{setting}_{outcome}", subset_jobs,
+                progress=subset_progress,
+            )[keep].copy()
+            result["cohort"] = setting
+            result["outcome"] = outcome
+            result["n_patients_with_copies"] = len(folded)
+            result["n_unique_patients"] = folded["_source_patient"].nunique()
+            result["bootstrap_id"] = replicate
+            rows.append(result)
+    return pd.concat(rows, ignore_index=True)
+
+
+_BOOTSTRAP_WORKER_STATE = None
+
+
+def _initialize_bootstrap_worker(raw, n_splits, random_state):
+    """Transfer original data once per worker, not once per submitted task."""
+    global _BOOTSTRAP_WORKER_STATE
+    _BOOTSTRAP_WORKER_STATE = (raw, n_splits, random_state)
+
+
+def _run_bootstrap_dataset(replicate):
+    """One worker computes one full bootstrap dataset, sequential subsets."""
+    if _BOOTSTRAP_WORKER_STATE is None:
+        raise RuntimeError("Bootstrap worker was not initialized.")
+    raw, n_splits, random_state = _BOOTSTRAP_WORKER_STATE
+    rng = np.random.default_rng(np.random.SeedSequence([random_state, replicate]))
+    indices = rng.integers(0, len(raw), size=len(raw))
+    sample = raw.iloc[indices].reset_index(drop=True)
+    # Avoid each process also launching its own native numerical thread pool.
+    with threadpool_limits(limits=1):
+        return _evaluate_bootstrap_sample(
+            sample, replicate, n_splits, random_state, subset_jobs=1,
+        )
+
+
 def run_patient_bootstrap(raw, output_dir, n_bootstraps=2000,
                           n_splits=10, random_state=42, n_jobs=1):
     """Ordinary patient bootstrap from the original raw dataset.
@@ -141,9 +193,16 @@ def run_patient_bootstrap(raw, output_dir, n_bootstraps=2000,
     paired prehospital/hospital measurements and outcomes. Cohort and outcome
     eligibility are applied after sampling. Each replicate reruns grouped CV
     and inner-fold threshold selection for all 127 subsets and four experiments.
+    n_jobs controls concurrent whole-dataset worker processes; each worker
+    evaluates its 508 subset/experiment combinations sequentially. Sampling
+    seeds depend on replicate IDs, so scheduling does not change resamples.
+    Replicate files and settings stay in output_dir; original estimates and
+    the final interval summary are written one directory above it.
     Replicate files are atomic checkpoints. The original estimate uses the same
     grouped-CV procedure. No bootstrap copy can cross an outer fold boundary.
     """
+    if not isinstance(n_jobs, (int, np.integer)) or n_jobs < 1:
+        raise ValueError("n_jobs must be a positive integer.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fingerprint = hashlib.sha256(
@@ -168,62 +227,87 @@ def run_patient_bootstrap(raw, output_dir, n_bootstraps=2000,
         if saved_settings != resampling_settings:
             raise ValueError("Checkpoint settings/data differ. Use a new output directory.")
     manifest.write_text(json.dumps(settings, indent=2) + "\n")
-    keep = ["subset_key", "subset_label", "features_json", "n_features",
-            "auc", "balanced_accuracy", "threshold_mean"]
-
     def evaluate_raw(sample, replicate, subset_progress=None):
-        rows = []
-        seed = int(np.random.SeedSequence([random_state, replicate + 1, 867]).generate_state(1)[0])
-        for setting, suffix in (("Prehospital", "1"), ("Hospital", "H")):
-            cohort = prepare_cohort(sample, suffix, gcs_cutoff=15)
-            for outcome in OUTCOMES:
-                folded = assign_grouped_folds(cohort, outcome, n_splits, seed)
-                result = evaluate_all_subsets(
-                    folded, outcome, f"bootstrap_{replicate}_{setting}_{outcome}", n_jobs,
-                    progress=subset_progress,
-                )[keep].copy()
-                result["cohort"] = setting
-                result["outcome"] = outcome
-                result["n_patients_with_copies"] = len(folded)
-                result["n_unique_patients"] = folded["_source_patient"].nunique()
-                result["bootstrap_id"] = replicate
-                rows.append(result)
-        return pd.concat(rows, ignore_index=True)
+        return _evaluate_bootstrap_sample(
+            sample, replicate, n_splits, random_state,
+            subset_jobs=n_jobs, subset_progress=subset_progress,
+        )
 
     def save_atomic(frame, destination):
         temporary = destination.with_suffix(".tmp")
         frame.to_csv(temporary, index=False)
         temporary.replace(destination)
 
-    original_path = output_dir / "original_estimates.csv"
+    original_path = output_dir.parent / "original_estimates.csv"
     if not original_path.exists():
         with tqdm(total=4 * len(SUBSETS), desc="Original dataset: subset evaluations",
                   unit="subset") as baseline_progress:
             save_atomic(evaluate_raw(raw, -1, subset_progress=baseline_progress), original_path)
     completed = {i for i in range(n_bootstraps)
                  if (output_dir / f"bootstrap_{i:04d}.csv").exists()}
+    remaining = [i for i in range(n_bootstraps) if i not in completed]
     with tqdm(total=n_bootstraps, initial=len(completed),
-              desc="Bootstrap datasets", unit="dataset") as bar:
-        for replicate in range(n_bootstraps):
-            if replicate in completed:
-                continue
-            rng = np.random.default_rng(np.random.SeedSequence([random_state, replicate]))
-            indices = rng.integers(0, len(raw), size=len(raw))
-            sample = raw.iloc[indices].reset_index(drop=True)
+              desc="Completed bootstrap datasets", unit="dataset") as bar:
+        if n_jobs == 1:
+            for replicate in remaining:
+                rng = np.random.default_rng(np.random.SeedSequence([random_state, replicate]))
+                indices = rng.integers(0, len(raw), size=len(raw))
+                sample = raw.iloc[indices].reset_index(drop=True)
+                try:
+                    with threadpool_limits(limits=1):
+                        result = _evaluate_bootstrap_sample(
+                            sample, replicate, n_splits, random_state, subset_jobs=1,
+                        )
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Bootstrap {replicate} failed. Completed checkpoints are retained; "
+                        "no failed dataset was silently discarded."
+                    ) from error
+                save_atomic(result, output_dir / f"bootstrap_{replicate:04d}.csv")
+                bar.update(1)
+        elif remaining:
+            worker_count = min(n_jobs, len(remaining))
+            remaining_ids = iter(remaining)
+            # Spawn is supported on macOS; functions live in this importable
+            # module rather than notebook cells so workers can reconstruct them.
+            pool = ProcessPoolExecutor(
+                max_workers=worker_count, mp_context=get_context("spawn"),
+                initializer=_initialize_bootstrap_worker,
+                initargs=(raw, n_splits, random_state),
+            )
+            pending = {}
             try:
-                result = evaluate_raw(sample, replicate)
-            except ValueError as error:
-                raise ValueError(
-                    f"Bootstrap {replicate} failed; no replicate was silently discarded. "
-                    "Review class counts/fold feasibility. Completed checkpoints are retained."
-                ) from error
-            save_atomic(result, output_dir / f"bootstrap_{replicate:04d}.csv")
-            bar.update()
+                for _ in range(worker_count):
+                    replicate = next(remaining_ids)
+                    pending[pool.submit(_run_bootstrap_dataset, replicate)] = replicate
+                bar.set_postfix(active=len(pending))
+                while pending:
+                    finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        replicate = pending.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as error:
+                            raise RuntimeError(
+                                f"Bootstrap {replicate} failed. Completed checkpoints are retained; "
+                                "no failed dataset was silently discarded."
+                            ) from error
+                        # Save immediately even when dataset IDs finish out of order.
+                        save_atomic(result, output_dir / f"bootstrap_{replicate:04d}.csv")
+                        bar.update(1)
+                        next_id = next(remaining_ids, None)
+                        if next_id is not None:
+                            pending[pool.submit(_run_bootstrap_dataset, next_id)] = next_id
+                    bar.set_postfix(active=len(pending))
+            finally:
+                for future in pending:
+                    future.cancel()
+                pool.shutdown(wait=True, cancel_futures=True)
     return summarize_bootstrap(output_dir, n_bootstraps)
 
 
 def summarize_bootstrap(output_dir, n_bootstraps=2000):
-    """Pointwise 2.5th/97.5th percentiles across 2,000 replicate estimates."""
+    """Read replicate CSVs from output_dir; read/write summaries in its parent."""
     output_dir = Path(output_dir)
     frames = []
     for i in tqdm(range(n_bootstraps), desc="Reading checkpoints", unit="file"):
@@ -242,14 +326,14 @@ def summarize_bootstrap(output_dir, n_bootstraps=2000):
     grouped = samples.groupby(keys)
     if not grouped.size().eq(n_bootstraps).all() or len(grouped) != 508:
         raise ValueError("Every experiment/subset must have all bootstrap estimates.")
-    summary = pd.read_csv(output_dir / "original_estimates.csv")
+    summary = pd.read_csv(output_dir.parent / "original_estimates.csv")
     summary = summary.rename(columns={"auc": "auc_estimate", "balanced_accuracy": "ba_estimate"})
     for metric, prefix in (("auc", "auc"), ("balanced_accuracy", "ba")):
         limits = grouped[metric].quantile([.025, .975]).unstack()
         limits.columns = [f"{prefix}_ci95_low", f"{prefix}_ci95_high"]
         summary = summary.merge(limits.reset_index(), on=keys, validate="one_to_one")
     summary["n_bootstraps"] = n_bootstraps
-    summary.to_csv(output_dir / "bootstrap_95ci_all_subsets.csv", index=False)
+    summary.to_csv(output_dir.parent / "bootstrap_95ci_all_subsets.csv", index=False)
     return summary
 
 
